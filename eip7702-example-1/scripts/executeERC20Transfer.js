@@ -1,59 +1,71 @@
 const { ethers } = require('hardhat');
 require('dotenv').config();
 
+// This script constructs an EIP-7702 style transaction so that:
+// 1. tokenHolder (no ETH) authorizes BatchCallDelegation as its temporary code.
+// 2. gasPayer (has ETH) signs & sends the transaction, paying the gas.
+// 3. The transaction "to" field is the tokenHolder address; its code executes BatchCallDelegation.execute.
+// 4. Inside BatchCallDelegation, msg.sender == tokenHolder, so ERC20.transfer spends tokenHolder's balance.
+
 const main = async () => {
-  const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, ethers.provider);
-  
+  const tokenHolderPk = process.env.TOKEN_HOLDER_PRIVATE_KEY || process.env.PRIVATE_KEY;
+  const gasPayerPk = process.env.GAS_PAYER_PRIVATE_KEY;
+  const recipient = process.env.RECIPIENT_ADDRESS;
+  const ERC20_TOKEN_ADDRESS = process.env.TOKEN_ADDRESS;
   const BATCH_CALL_DELEGATION_ADDRESS = process.env.BATCH_CALL_DELEGATION_ADDRESS;
-  if (!BATCH_CALL_DELEGATION_ADDRESS) {
-    throw new Error('BATCH_CALL_DELEGATION_ADDRESS not set in environment');
-  }
-  
-  console.log(`Using BatchCallDelegation at: ${BATCH_CALL_DELEGATION_ADDRESS}`);
 
-  // Define ERC20 interface with transfer function signature
+  if (!tokenHolderPk || !gasPayerPk) throw new Error('Missing TOKEN_HOLDER_PRIVATE_KEY or GAS_PAYER_PRIVATE_KEY in .env');
+  if (!ERC20_TOKEN_ADDRESS) throw new Error('Missing TOKEN_ADDRESS');
+  if (!recipient) throw new Error('Missing RECIPIENT_ADDRESS');
+  if (!BATCH_CALL_DELEGATION_ADDRESS) throw new Error('Missing BATCH_CALL_DELEGATION_ADDRESS');
+
+  const tokenHolder = new ethers.Wallet(tokenHolderPk, ethers.provider);
+  const gasPayer = new ethers.Wallet(gasPayerPk, ethers.provider);
+
+  console.log(`Token holder: ${tokenHolder.address}`);
+  console.log(`Gas payer   : ${gasPayer.address}`);
+  console.log(`BatchCallDelegation contract: ${BATCH_CALL_DELEGATION_ADDRESS}`);
+
+  // Interface for ERC20.transfer
   const erc20Interface = new ethers.Interface([
-    "function transfer(address to, uint256 amount)"
-  ]);
-    
-  // Define ERC20 transfer parameters
-  const ERC20_TOKEN_ADDRESS = process.env.TOKEN_ADDRESS; // ERC20代币地址
-  const transferAmount = ethers.parseUnits("1.0", 6); // 转账1个代币，假设decimals为18
-
-  // 编码ERC20 transfer函数调用
-  const tokenTransferData = erc20Interface.encodeFunctionData("transfer", [
-    process.env.RECIPIENT_ADDRESS,
-    transferAmount
+    'function transfer(address to, uint256 amount)'
   ]);
 
-  // 将ERC20转账打包到BatchCallDelegation的调用中
+  // Set transfer amount (adjust decimals properly; here assuming 6 per previous code comment looked wrong vs 18)
+  // If your token has 18 decimals change second arg to 18.
+  const transferAmount = ethers.parseUnits('1.12', 6);
+
+  // Data for ERC20 transfer (msg.sender must be tokenHolder)
+  const tokenTransferData = erc20Interface.encodeFunctionData('transfer', [recipient, transferAmount]);
+
+  // Batch interface
   const batchInterface = new ethers.Interface([
-    "function execute(tuple(bytes data, address to, uint256 value)[] calls)"
+    'function execute(tuple(bytes data, address to, uint256 value)[] calls)'
   ]);
 
   const calls = [
-    {
-      data: tokenTransferData,
-      to: ERC20_TOKEN_ADDRESS,
-      value: 0 // ERC20转账不需要发送ETH
-    }
+    { data: tokenTransferData, to: ERC20_TOKEN_ADDRESS, value: 0 }
   ];
 
-  // Encode the execute function call with parameters
-  const calldata = batchInterface.encodeFunctionData("execute", [calls]);
+  // calldata that will be executed as tokenHolder's temporary code
+  const calldata = batchInterface.encodeFunctionData('execute', [calls]);
 
-  const currentNonce = await ethers.provider.getTransactionCount(wallet.address);
-  const chainId = await ethers.provider.getNetwork().then(network => network.chainId);
+  // Fetch nonces separately
+  const tokenHolderNonce = await ethers.provider.getTransactionCount(tokenHolder.address);
+  const gasPayerNonce = await ethers.provider.getTransactionCount(gasPayer.address);
+  const chainId = (await ethers.provider.getNetwork()).chainId;
 
+  // Authorization for tokenHolder -> BatchCallDelegation (EIP-7702 authorization list entry)
+  // Use tokenHolder's current nonce (NOT +1). Incrementing incorrectly can invalidate authorization.
   const authorizationData = {
     chainId: ethers.toBeHex(chainId),
     address: BATCH_CALL_DELEGATION_ADDRESS,
-    nonce: ethers.toBeHex(currentNonce + 1),
-  }
+    nonce: ethers.toBeHex(tokenHolderNonce) // tokenHolder account nonce used for authorization
+  };
 
-  // Encode authorization data according to EIP-712 standard
+  // Encode authorization (magic + RLP per draft spec)
   const encodedAuthorizationData = ethers.concat([
-    '0x05', // MAGIC code for EIP7702
+    '0x05', // MAGIC for 7702 authorization object
     ethers.encodeRlp([
       authorizationData.chainId,
       authorizationData.address,
@@ -61,33 +73,34 @@ const main = async () => {
     ])
   ]);
 
-  // Generate and sign authorization data hash
+  // Sign authorization with tokenHolder (no gas payment, only signature)
   const authorizationDataHash = ethers.keccak256(encodedAuthorizationData);
-  const authorizationSignature = wallet.signingKey.sign(authorizationDataHash);
-
-  // Store signature components
-  authorizationData.yParity = authorizationSignature.yParity == 0 ? '0x' : '0x01';
+  const authorizationSignature = tokenHolder.signingKey.sign(authorizationDataHash);
+  authorizationData.yParity = authorizationSignature.yParity === 0 ? '0x' : '0x01';
   authorizationData.r = authorizationSignature.r;
   authorizationData.s = authorizationSignature.s;
 
-  // Get current gas fee data from the network
+  // Fee data
   const feeData = await ethers.provider.getFeeData();
+  let maxPriorityFeePerGas = ethers.toBeHex(feeData.maxPriorityFeePerGas || 0n);
+  maxPriorityFeePerGas = maxPriorityFeePerGas === '0x00' ? '0x' : maxPriorityFeePerGas; // per 7702 spec representation for zero tip
 
-  let maxPriorityFeePerGas = ethers.toBeHex(feeData.maxPriorityFeePerGas);
-  maxPriorityFeePerGas = maxPriorityFeePerGas === '0x00'? '0x' : maxPriorityFeePerGas;
+  // Conservative gas limit (reduce from 10,000,000). BatchCallDelegation.execute + ERC20.transfer should be < 150k.
+  const gasLimit = ethers.toBeHex(300000);
 
-  // Prepare complete transaction data structure
+  // Transaction data (type 0x04 per EIP-7702 draft): sender implicitly = gasPayer (from its signature)
+  // 'to' MUST be tokenHolder address whose code will be overridden by authorization entry.
   const txData = [
-    authorizationData.chainId,
-    ethers.toBeHex(currentNonce),
-    maxPriorityFeePerGas, // Priority fee (tip)
-    ethers.toBeHex(feeData.maxFeePerGas), // Maximum total fee willing to pay
-    ethers.toBeHex(10000000), // Gas limit
-    wallet.address, // Sender address
-    '0x', // Value (no ETH being sent)
-    calldata, // Encoded function call
-    [], // Access list (empty for this transaction)
-    [
+    ethers.toBeHex(chainId),
+    ethers.toBeHex(gasPayerNonce), // transaction nonce of gasPayer
+    maxPriorityFeePerGas,
+    ethers.toBeHex(feeData.maxFeePerGas),
+    gasLimit,
+    tokenHolder.address, // to = tokenHolder (executes authorized code)
+    '0x', // value
+    calldata, // input
+    [], // accessList
+    [ // authorization list (array of authorizations)
       [
         authorizationData.chainId,
         authorizationData.address,
@@ -99,57 +112,51 @@ const main = async () => {
     ]
   ];
 
+  console.log('txData (pre-sign) =======================================');
+  console.dir(txData, { depth: null });
+  console.log('==========================================================');
 
-  console.log("txData=======================================================");
-  console.log("txData====",txData);
-  console.log("txData======================================================");
-  // Encode final transaction data with version prefix
   const encodedTxData = ethers.concat([
-    '0x04', // Transaction type identifier
+    '0x04', // transaction type identifier for 7702
     ethers.encodeRlp(txData)
   ]);
 
-  // Sign the complete transaction
+  // Sign transaction with GAS PAYER (this pays the gas)
   const txDataHash = ethers.keccak256(encodedTxData);
-  const txSignature = wallet.signingKey.sign(txDataHash);
+  const txSignature = gasPayer.signingKey.sign(txDataHash);
 
-  // Construct the fully signed transaction
   const signedTx = ethers.hexlify(ethers.concat([
     '0x04',
     ethers.encodeRlp([
       ...txData,
-      txSignature.yParity == 0 ? '0x' : '0x01',
+      txSignature.yParity === 0 ? '0x' : '0x01',
       txSignature.r,
       txSignature.s
     ])
   ]));
 
-  // Before sending, check if we have enough balance
+  // Pre-flight: token balance of tokenHolder
   const erc20Contract = new ethers.Contract(ERC20_TOKEN_ADDRESS, [
-    "function balanceOf(address) view returns (uint256)",
-    "function decimals() view returns (uint8)",
-    "function symbol() view returns (string)"
+    'function balanceOf(address) view returns (uint256)',
+    'function decimals() view returns (uint8)',
+    'function symbol() view returns (string)'
   ], ethers.provider);
 
   const [balance, decimals, symbol] = await Promise.all([
-    erc20Contract.balanceOf(wallet.address),
+    erc20Contract.balanceOf(tokenHolder.address),
     erc20Contract.decimals(),
     erc20Contract.symbol()
   ]);
 
-  console.log(`Current ${symbol} balance: ${ethers.formatUnits(balance, decimals)}`);
+  console.log(`Current ${symbol} balance of tokenHolder: ${ethers.formatUnits(balance, decimals)}`);
   console.log(`Attempting to transfer: ${ethers.formatUnits(transferAmount, decimals)} ${symbol}`);
+  if (balance < transferAmount) throw new Error('Insufficient token balance');
 
-  if (balance < transferAmount) {
-    throw new Error(`Insufficient balance. Have ${ethers.formatUnits(balance, decimals)} ${symbol}, need ${ethers.formatUnits(transferAmount, decimals)} ${symbol}`);
-  }
-
-  // Send the raw transaction to the network
+  // Send raw transaction
   const txHash = await ethers.provider.send('eth_sendRawTransaction', [signedTx]);
-  
-  console.log('Transaction sent: ', txHash);
+  console.log('Transaction sent (hash):', txHash);
 
-  // Wait for transaction using polling
+  console.log('Waiting for transaction to be mined...');
   console.log('Waiting for transaction to be mined...');
 
   let receipt = null;
@@ -181,9 +188,10 @@ const main = async () => {
   console.log('Block number:', receipt.blockNumber);
   console.log('Gas used:', receipt.gasUsed.toString());
 
-  // Check new balance
-  const newBalance = await erc20Contract.balanceOf(wallet.address);
-  console.log(`New ${symbol} balance: ${ethers.formatUnits(newBalance, decimals)}`);
+  // Check new balance of tokenHolder
+  const newBalance = await erc20Contract.balanceOf(tokenHolder.address);
+  console.log(`New ${symbol} balance of tokenHolder: ${ethers.formatUnits(newBalance, decimals)}`);
+  console.log(`Gas payer ETH spent can be checked via explorer on ${gasPayer.address}`);
 }
 
 main().then(() => {
