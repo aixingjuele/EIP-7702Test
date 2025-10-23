@@ -33,7 +33,7 @@ const main = async () => {
 
   // Set transfer amount (adjust decimals properly; here assuming 6 per previous code comment looked wrong vs 18)
   // If your token has 18 decimals change second arg to 18.
-  const transferAmount = ethers.parseUnits('1.12', 6);
+  const transferAmount = ethers.parseUnits('1.123', 6);
 
   // Data for ERC20 transfer (msg.sender must be tokenHolder)
   const tokenTransferData = erc20Interface.encodeFunctionData('transfer', [recipient, transferAmount]);
